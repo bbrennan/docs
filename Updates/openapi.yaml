@@ -1,0 +1,1251 @@
+openapi: 3.1.1
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: Context Factory Service
+  version: 1.0.0-draft
+  description: Reviewable CFS contract draft dated 2026-10-22. Shared contexts are identified by tenantId + refLabel
+    + refId, independently of writer or LTM bindings. Policies are mandatory on creation and immutable. policy.ltm
+    configures label rules; request.ltm supplies actual identity values; CFS generates backend tags. This describes
+    intended behavior, not a deployed implementation. Read x-design-decisions before treating lifecycle semantics
+    as final. API Gateway integration resources and deployment URLs are intentionally absent.
+servers:
+- url: /cfs/v1
+  description: Relative base URL; bind to the private deployment origin.
+security:
+- awsSigV4: []
+tags:
+- name: Contexts
+  description: Shared raw-event history.
+- name: Policies
+  description: Read-only context policy inspection.
+- name: Long-term memory
+  description: Precomputed summaries and relevant-memory recall.
+- name: Erasure
+  description: Cross-app source and derived-memory deletion.
+- name: Operations
+  description: Readiness.
+x-design-decisions:
+  agreed-direction:
+  - Use /cfs/v1 and refLabel consistently; appId does not define or select contexts.
+  - One shared history for a tenant/refLabel/refId, with all authorized writers included in reads.
+  - Require an immutable per-context policy at creation; no policy PATCH.
+  - policy.ltm maps labels to per-key TTL/window rules; request.ltm supplies additional business identity values.
+  - Hindsight bank and tag details remain internal to CFS.
+  proposed-for-signoff:
+  - Context-wide contributions; late bindings include earlier recoverable eligible history without resetting retention.
+    Deleted history is not restored and an unbound key does not preserve it.
+  - Per-event retention anchored to CFS recordedAt; windows anchored to occurredAt, falling back to recordedAt.
+  - Overall plus configured-window summaries; shared scopes preserve per-contribution expiry and union windows across
+    active contributors.
+  - Each successful POST appends an event; client duplicate suppression is deferred. Repeated POSTs may append another
+    event.
+  - Affected data reads and writes return 409 ERASURE_PENDING while cleanup is pending; policy inspection is metadata-only.
+  - Ordinary evidence expiry retains compact Context/Policy metadata by default; finite retirement and identity
+    recreation rules require signoff.
+  implementation-validation-required:
+  - Candidate bank per tenant with per_tag observations; prove isolation and independent per-key expiry before selecting
+    layout.
+  - Hindsight temporal_window is ranking only; enforce strict evidence cutoffs and age-driven refresh/invalidation.
+  - Prove late-binding backfill, derived-memory erasure, summary invalidation, and cross-store failure recovery.
+  - Pin a Hindsight version and measure worker freshness, bank scale, and cleanup deadlines.
+  ownership-open: Business owner and authenticated principal permissions for first policy creation require signoff;
+    writers do not automatically own policy creation or erasure.
+  erasure-open: Completion-record lifetime, controlled reopening of an erased subject, and deletion SLA require
+    operational policy.
+paths:
+  /contexts:
+    parameters:
+    - $ref: '#/components/parameters/TenantId'
+    post:
+      tags:
+      - Contexts
+      operationId: writeContext
+      summary: Create a context with its locked policy, or append a shared event
+      description: Creation requires policy. Existing-context writes use established policy and bindings; supplied
+        policy must match. Adding a permitted unset binding joins the same context; an unconfigured label or different
+        policy is rejected, never routed to a second context. Returns only after the event is durable. Each successful
+        POST records a new event. Repeating POST after an uncertain response can append another event; duplicate
+        suppression is outside the current contract. LTM extraction is asynchronous. Unknown body fields and unsupported
+        query parameters are rejected.
+      requestBody:
+        required: true
+        description: 'JSON body. Content-Type: application/json identifies its format; JSON-capable HTTP clients
+          commonly set this header.'
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WriteContextRequest'
+            examples:
+              create:
+                summary: Create a shared context (search/visitor example)
+                value:
+                  refLabel: search
+                  refId: search-123
+                  ltm:
+                    visitor: visitor-42
+                  policy:
+                    stm:
+                      cache:
+                        ttl: PT24H
+                      durability:
+                        ttl: P30D
+                    ltm:
+                      search:
+                        ttl: P30D
+                      visitor:
+                        ttl: P365D
+                        windows:
+                        - P7D
+                        - P30D
+                        - P90D
+                  data:
+                    eventType: searchPerformed
+                    query: red SUV under 30k near Austin
+                    resultCount: 24
+              append:
+                summary: Another authorized app contributes to the same search
+                value:
+                  refLabel: search
+                  refId: search-123
+                  data:
+                    eventType: priceAlertSet
+                    priceMax: 30000
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '201':
+          $ref: '#/components/responses/ContextCreated'
+        '200':
+          $ref: '#/components/responses/WriteAccepted'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/TooLarge'
+    get:
+      tags:
+      - Contexts
+      operationId: readContext
+      summary: Read shared recent raw events
+      description: 'Read one directly keyed context, including all authorized writers. Does not aggregate linked
+        contexts; use summaries or memories for subject memory across linked contexts. Newest first by recordedAt
+        then entryId, both descending. No writer selector or pagination cursor. Missing context returns an empty
+        list; no rows are created. Proposed serving guard: return 409 ERASURE_PENDING for affected data while erasure
+        is pending.'
+      parameters:
+      - $ref: '#/components/parameters/RefLabel'
+      - $ref: '#/components/parameters/RefId'
+      - $ref: '#/components/parameters/ContextLimit'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '200':
+          $ref: '#/components/responses/ContextRead'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    delete:
+      tags:
+      - Erasure
+      operationId: eraseIdentity
+      summary: Erase a direct or linked identity across apps
+      description: Find the directly keyed context and every context bound to this identity. Establish an erasure
+        guard that also covers racing writes and new bindings. Remove affected source/derived evidence and invalidate
+        all affected summaries, including other identities. Repeat the same request to poll. 200 DONE requires completed
+        cleanup; unknown identity is already DONE. Completion-record retention and authorized reopening need an
+        implementation policy.
+      parameters:
+      - $ref: '#/components/parameters/RefLabel'
+      - $ref: '#/components/parameters/RefId'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '202':
+          $ref: '#/components/responses/ErasurePending'
+        '200':
+          $ref: '#/components/responses/ErasureDone'
+  /policies:
+    parameters:
+    - $ref: '#/components/parameters/TenantId'
+    get:
+      tags:
+      - Policies
+      operationId: readContextPolicy
+      summary: Read one context's immutable policy
+      description: Select by the full context identity, not by label alone. Linked-identity summaries do not imply
+        a standalone policy row for that identity. There is no policy PATCH or other standalone policy mutation.
+      parameters:
+      - $ref: '#/components/parameters/RefLabel'
+      - $ref: '#/components/parameters/RefId'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '200':
+          $ref: '#/components/responses/PolicyRead'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /summaries:
+    parameters:
+    - $ref: '#/components/parameters/TenantId'
+    get:
+      tags:
+      - Long-term memory
+      operationId: readSummary
+      summary: Read a precomputed summary for a business identity
+      description: 'Select an own-context or linked identity. Omit window for overall retained evidence; specify
+        a configured window for a rolling summary. Proposed shared-scope rule: preserve each contribution''s own
+        expiry and union configured windows across active contributors. A known subject with eligible evidence but
+        an unsupported window is 400 UNSUPPORTED_WINDOW. READY means a valid materialization exists; PENDING means
+        eligible/configured work awaits generation; EMPTY means an unknown subject, no eligible evidence, or disabled
+        LTM. Never serve invalidated/expired text as ready. No backend outage is converted to EMPTY. Proposed serving
+        guard: return 409 ERASURE_PENDING for an affected subject during cleanup. Hard window/retention behavior
+        requires Hindsight validation.'
+      parameters:
+      - $ref: '#/components/parameters/RefLabel'
+      - $ref: '#/components/parameters/RefId'
+      - $ref: '#/components/parameters/Window'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '200':
+          $ref: '#/components/responses/SummaryRead'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /memories:
+    parameters:
+    - $ref: '#/components/parameters/TenantId'
+    get:
+      tags:
+      - Long-term memory
+      operationId: recallMemories
+      summary: Recall relevant scoped facts and observations
+      description: 'Resolve a non-empty authorized subject scope internally and recall relevant eligible memories.
+        No request-time generative answer synthesis is requested; configured retrieval may use embeddings and reranking.
+        A missing scope returns an empty list without issuing unscoped Hindsight recall. Proposed serving guard:
+        return 409 ERASURE_PENDING for an affected subject during cleanup. Independent-expiry enforcement remains
+        a validation requirement.'
+      parameters:
+      - $ref: '#/components/parameters/RefLabel'
+      - $ref: '#/components/parameters/RefId'
+      - $ref: '#/components/parameters/Query'
+      - $ref: '#/components/parameters/MemoryLimit'
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '200':
+          $ref: '#/components/responses/MemoryRead'
+        '409':
+          $ref: '#/components/responses/Conflict'
+  /health:
+    get:
+      tags:
+      - Operations
+      operationId: getHealth
+      summary: Check process readiness
+      description: IAM authentication is still required. No tenant header is needed. Does not guarantee all backing
+        stores are healthy.
+      responses:
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/Throttled'
+        '503':
+          $ref: '#/components/responses/Unavailable'
+        '200':
+          $ref: '#/components/responses/Healthy'
+components:
+  securitySchemes:
+    awsSigV4:
+      type: apiKey
+      in: header
+      name: Authorization
+      x-amazon-apigateway-authtype: awsSigv4
+      description: AWS IAM Signature Version 4, represented using the AWS-documented OpenAPI security extension.
+        This is not a static API key. Use a SigV4 signer, including date/session-token headers as applicable; authorize
+        tenant and subject separately.
+  parameters:
+    TenantId:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: ^[A-Za-z0-9._:-]{1,128}$
+      example: toyota
+      description: Tenant selector, checked against the SigV4-authenticated principal. It is not an authorization
+        credential.
+    RefLabel:
+      name: refLabel
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/RefLabel'
+      example: search
+    RefId:
+      name: refId
+      in: query
+      required: true
+      schema:
+        $ref: '#/components/schemas/RefId'
+      example: search-123
+    ContextLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 64
+        default: 20
+    MemoryLimit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 20
+        default: 5
+    Window:
+      name: window
+      in: query
+      schema:
+        $ref: '#/components/schemas/Window'
+      example: P30D
+      description: Select one configured rolling-window summary. Omit for the overall retained-evidence summary.
+        Configuration reconciliation across contributing contexts is a proposed design rule, not an implemented
+        guarantee.
+    Query:
+      name: q
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 1000
+      example: budget and body style
+  schemas:
+    RefLabel:
+      type: string
+      pattern: ^[a-z][A-Za-z0-9]{0,63}$
+      examples:
+      - search
+      - visitor
+      description: Business identifier label. The same label can have many distinct values.
+    RefId:
+      type: string
+      pattern: ^[A-Za-z0-9._:-]{1,128}$
+      examples:
+      - search-123
+      - visitor-42
+      description: Opaque business identifier value supplied by the caller; avoid personal data such as email addresses.
+    Duration:
+      type: string
+      pattern: ^(P[1-9][0-9]*D|PT[1-9][0-9]*[HM])$
+      examples:
+      - PT24H
+      - P30D
+      description: Positive whole days, hours, or minutes. Bounds and cross-field rules require runtime validation.
+    Window:
+      type: string
+      pattern: ^P[1-9][0-9]*D$
+      examples:
+      - P7D
+      - P30D
+      description: Positive whole-day look-back period; must not exceed the corresponding LTM TTL.
+    TtlRule:
+      type: object
+      additionalProperties: false
+      properties:
+        ttl:
+          $ref: '#/components/schemas/Duration'
+      required:
+      - ttl
+    StmPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        cache:
+          $ref: '#/components/schemas/TtlRule'
+        durability:
+          $ref: '#/components/schemas/TtlRule'
+      required:
+      - durability
+      description: 'cache is optional; omission disables Redis. Proposed bounds: cache 1 minute–7 days, durability
+        1–365 days.'
+    LtmRule:
+      type: object
+      additionalProperties: false
+      properties:
+        ttl:
+          $ref: '#/components/schemas/Duration'
+        windows:
+          type: array
+          minItems: 1
+          maxItems: 5
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Window'
+      required:
+      - ttl
+      description: 'Retention for this context contribution to one identity; optional additional rolling-window
+        summaries. Proposed LTM bounds: 1–730 days.'
+    LtmPolicy:
+      type: object
+      minProperties: 1
+      maxProperties: 5
+      propertyNames:
+        pattern: ^[a-z][A-Za-z0-9]{0,63}$
+      additionalProperties:
+        $ref: '#/components/schemas/LtmRule'
+      description: LTM key labels mapped to rules. Must include the context refLabel. Actual identity values are
+        not stored here.
+    Policy:
+      type: object
+      additionalProperties: false
+      properties:
+        stm:
+          $ref: '#/components/schemas/StmPolicy'
+        ltm:
+          $ref: '#/components/schemas/LtmPolicy'
+      required:
+      - stm
+      description: Complete immutable context policy. Omit ltm to disable LTM. No mutation operation exists. For
+        equality, ignore object order, normalize durations to seconds, and compare windows as sets.
+      examples:
+      - stm:
+          cache:
+            ttl: PT24H
+          durability:
+            ttl: P30D
+        ltm:
+          search:
+            ttl: P30D
+          visitor:
+            ttl: P365D
+            windows:
+            - P7D
+            - P30D
+            - P90D
+    LtmBindings:
+      type: object
+      maxProperties: 4
+      propertyNames:
+        pattern: ^[a-z][A-Za-z0-9]{0,63}$
+      additionalProperties:
+        $ref: '#/components/schemas/RefId'
+      description: Additional LTM labels mapped to actual identity values, one ID per label. Each label must be
+        permitted by policy.ltm and differ from refLabel. Omitting a stored value does not remove it. An unset value
+        may be added; an existing value cannot change. Fields inside data do not establish bindings. Historical
+        backfill covers only recoverable eligible evidence; a configured unbound key does not preserve already deleted
+        history.
+      examples:
+      - visitor: visitor-42
+    EventData:
+      type: object
+      additionalProperties: true
+      description: Application-defined event payload; encoded JSON must not exceed 65,536 UTF-8 bytes. eventType
+        is recommended when apps write different event shapes.
+      x-max-utf8-bytes: 65536
+      examples:
+      - eventType: searchPerformed
+        query: red SUV under 30k near Austin
+    WriteContextRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        refLabel:
+          $ref: '#/components/schemas/RefLabel'
+        refId:
+          $ref: '#/components/schemas/RefId'
+        ltm:
+          $ref: '#/components/schemas/LtmBindings'
+        policy:
+          $ref: '#/components/schemas/Policy'
+        data:
+          $ref: '#/components/schemas/EventData'
+        occurredAt:
+          type: string
+          format: date-time
+      required:
+      - refLabel
+      - refId
+      - data
+      description: Create or append by business identity. policy is required only if the context does not exist;
+        this depends on server state and is checked at runtime. On an existing context, a supplied policy must be
+        semantically equivalent to its locked policy. occurredAt is source event time; CFS assigns recordedAt.
+      x-runtime-rules:
+      - New context requires policy; both metadata records are established atomically in Postgres.
+      - Context uniqueness is tenantId + refLabel + refId, irrespective of LTM bindings or writer.
+      - Internal ctxId is c_ plus the first 32 lowercase hex characters of SHA256(UTF8(tenantId + pipe + refLabel
+        + pipe + refId)); pipe is literal | and is excluded from validated input values. Inputs are case-sensitive
+        and used without normalization. LTM bindings, policy, and app identity are excluded. A hash collision with
+        a different tuple must fail without accessing that context.
+      - Resolve each supplied ltm label against the locked policy; reject unknown labels and conflicting existing
+        values.
+      - Reject source data above 65,536 UTF-8 bytes and full request bodies above 131,072 UTF-8 bytes.
+      - Apply erasure guards before accepting events.
+      examples:
+      - refLabel: search
+        refId: search-123
+        ltm:
+          visitor: visitor-42
+        policy:
+          stm:
+            cache:
+              ttl: PT24H
+            durability:
+              ttl: P30D
+          ltm:
+            search:
+              ttl: P30D
+            visitor:
+              ttl: P365D
+              windows:
+              - P7D
+              - P30D
+              - P90D
+        data:
+          eventType: searchPerformed
+          query: red SUV under 30k near Austin
+          resultCount: 24
+      - refLabel: search
+        refId: search-123
+        data:
+          eventType: priceAlertSet
+          priceMax: 30000
+    WriteResult:
+      type: object
+      additionalProperties: false
+      properties:
+        entryId:
+          type: string
+          format: uuid
+          description: CFS-assigned UUID identifying one stored event. Repeated POSTs may create distinct events.
+        recordedAt:
+          type: string
+          format: date-time
+      required:
+      - entryId
+      - recordedAt
+    Meta:
+      type: object
+      additionalProperties: false
+      properties:
+        traceId:
+          type: string
+          minLength: 1
+        timestamp:
+          type: string
+          format: date-time
+      required:
+      - traceId
+      - timestamp
+    WriteResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          $ref: '#/components/schemas/WriteResult'
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    Entry:
+      type: object
+      additionalProperties: false
+      properties:
+        entryId:
+          type: string
+          format: uuid
+        recordedAt:
+          type: string
+          format: date-time
+        occurredAt:
+          type: string
+          format: date-time
+        data:
+          $ref: '#/components/schemas/EventData'
+      required:
+      - entryId
+      - recordedAt
+      - data
+    ContextReadResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            entries:
+              type: array
+              maxItems: 64
+              items:
+                $ref: '#/components/schemas/Entry'
+          required:
+          - entries
+          description: All authorized writers, ordered by recordedAt descending then entryId descending. Recent-history
+            API only; no cursor. An unknown/empty context returns an empty list.
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    PolicyReadResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            refLabel:
+              $ref: '#/components/schemas/RefLabel'
+            refId:
+              $ref: '#/components/schemas/RefId'
+            policy:
+              $ref: '#/components/schemas/Policy'
+            locked:
+              type: boolean
+              const: true
+            createdAt:
+              type: string
+              format: date-time
+          required:
+          - refLabel
+          - refId
+          - policy
+          - locked
+          - createdAt
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    OverallSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        text:
+          type: string
+          minLength: 1
+        asOf:
+          type: string
+          format: date-time
+          description: Evidence evaluation time; anchors the rolling window.
+        computedAt:
+          type: string
+          format: date-time
+          description: When generation completed.
+        sourceThrough:
+          type: string
+          format: date-time
+          description: Latest recorded source timestamp considered; not a guarantee that all more recent writes
+            are incorporated.
+        validUntil:
+          type: string
+          format: date-time
+          description: Do not serve this materialization as ready at or after this time. Writes, expiry, erasure,
+            or binding changes can invalidate it earlier.
+        kind:
+          type: string
+          const: ALL
+      required:
+      - kind
+      - text
+      - asOf
+      - computedAt
+      - sourceThrough
+      - validUntil
+    WindowSummary:
+      type: object
+      additionalProperties: false
+      properties:
+        text:
+          type: string
+          minLength: 1
+        asOf:
+          type: string
+          format: date-time
+          description: Evidence evaluation time; anchors the rolling window.
+        computedAt:
+          type: string
+          format: date-time
+          description: When generation completed.
+        sourceThrough:
+          type: string
+          format: date-time
+          description: Latest recorded source timestamp considered; not a guarantee that all more recent writes
+            are incorporated.
+        validUntil:
+          type: string
+          format: date-time
+          description: Do not serve this materialization as ready at or after this time. Writes, expiry, erasure,
+            or binding changes can invalidate it earlier.
+        kind:
+          type: string
+          const: WINDOW
+        window:
+          $ref: '#/components/schemas/Window'
+        windowStart:
+          type: string
+          format: date-time
+        windowEnd:
+          type: string
+          format: date-time
+      required:
+      - kind
+      - window
+      - windowStart
+      - windowEnd
+      - text
+      - asOf
+      - computedAt
+      - sourceThrough
+      - validUntil
+      description: Evidence interval is [windowStart, windowEnd), with windowEnd = asOf. Only eligible evidence
+        in that interval may contribute. These relationships require runtime validation.
+    Summary:
+      oneOf:
+      - $ref: '#/components/schemas/OverallSummary'
+      - $ref: '#/components/schemas/WindowSummary'
+    SummaryResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              enum:
+              - READY
+              - PENDING
+              - EMPTY
+            items:
+              type: array
+              maxItems: 1
+              items:
+                $ref: '#/components/schemas/Summary'
+          required:
+          - status
+          - items
+          description: One requested overall/window materialization. READY has one valid item; PENDING and EMPTY
+            have no items. Pending is not backend failure.
+          allOf:
+          - if:
+              properties:
+                status:
+                  const: READY
+              required:
+              - status
+            then:
+              properties:
+                items:
+                  minItems: 1
+            else:
+              properties:
+                items:
+                  maxItems: 0
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    Memory:
+      type: object
+      additionalProperties: false
+      properties:
+        memoryId:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Opaque CFS memory reference; clients must not parse it.
+        text:
+          type: string
+          minLength: 1
+        type:
+          type: string
+          enum:
+          - FACT
+          - OBSERVATION
+          description: CFS category; backend world/experience facts map to FACT.
+        occurredAt:
+          type: string
+          format: date-time
+      required:
+      - memoryId
+      - text
+      - type
+    MemoryResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            memories:
+              type: array
+              maxItems: 20
+              items:
+                $ref: '#/components/schemas/Memory'
+          required:
+          - memories
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    ErasurePendingResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              const: PENDING
+          required:
+          - status
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    ErasureDoneResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              const: DONE
+          required:
+          - status
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        data:
+          type: object
+          additionalProperties: false
+          properties:
+            status:
+              type: string
+              const: OK
+          required:
+          - status
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - data
+      - meta
+    ErrorResponse:
+      type: object
+      additionalProperties: false
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          properties:
+            code:
+              type: string
+              enum:
+              - VALIDATION_ERROR
+              - INVALID_POLICY
+              - POLICY_REQUIRED
+              - UNKNOWN_LTM_KEY
+              - UNSUPPORTED_WINDOW
+              - POLICY_CONFLICT
+              - LTM_KEY_CONFLICT
+              - ERASURE_PENDING
+              - CONTEXT_NOT_FOUND
+              - REQUEST_TOO_LARGE
+              - RATE_LIMITED
+              - SERVICE_UNAVAILABLE
+              - FORBIDDEN
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                properties:
+                  path:
+                    type: string
+                  message:
+                    type: string
+                required:
+                - path
+                - message
+          required:
+          - code
+          - message
+        meta:
+          $ref: '#/components/schemas/Meta'
+      required:
+      - error
+      - meta
+    GatewayError:
+      type: object
+      required:
+      - message
+      properties:
+        message:
+          type: string
+      additionalProperties: true
+      description: Representative gateway-native error; no CFS envelope is guaranteed before the request reaches
+        CFS.
+  responses:
+    ContextCreated:
+      description: New context and first durable event accepted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/WriteResponse'
+          example:
+            data:
+              entryId: 20000000-0000-4000-8000-000000000001
+              recordedAt: '2026-10-21T16:00:00Z'
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    WriteAccepted:
+      description: Durable append accepted. Each successful POST records a new event; repeated submissions may append
+        another event.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/WriteResponse'
+          example:
+            data:
+              entryId: 20000000-0000-4000-8000-000000000002
+              recordedAt: '2026-10-21T16:01:00Z'
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    ContextRead:
+      description: Recent live entries from all authorized writers; unknown context returns an empty list.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ContextReadResponse'
+          example:
+            data:
+              entries:
+              - entryId: 20000000-0000-4000-8000-000000000001
+                recordedAt: '2026-10-21T16:00:00Z'
+                data:
+                  eventType: searchPerformed
+                  query: red SUV under 30k near Austin
+                  resultCount: 24
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    PolicyRead:
+      description: The exact context policy and its creation timestamp.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/PolicyReadResponse'
+          example:
+            data:
+              refLabel: search
+              refId: search-123
+              policy:
+                stm:
+                  cache:
+                    ttl: PT24H
+                  durability:
+                    ttl: P30D
+                ltm:
+                  search:
+                    ttl: P30D
+                  visitor:
+                    ttl: P365D
+                    windows:
+                    - P7D
+                    - P30D
+                    - P90D
+              locked: true
+              createdAt: '2026-10-21T16:00:00Z'
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    SummaryRead:
+      description: One ready materialization, pending generation, or no eligible evidence. Does not synchronously
+        generate a summary.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/SummaryResponse'
+          examples:
+            ready:
+              value:
+                data:
+                  status: READY
+                  items:
+                  - kind: WINDOW
+                    window: P30D
+                    windowStart: '2026-09-21T16:00:00Z'
+                    windowEnd: '2026-10-21T16:00:00Z'
+                    text: Recent searches focus on red SUVs under $30,000 near Austin.
+                    asOf: '2026-10-21T16:00:00Z'
+                    computedAt: '2026-10-21T16:00:01Z'
+                    sourceThrough: '2026-10-21T15:59:00Z'
+                    validUntil: '2026-10-21T16:05:00Z'
+                meta:
+                  traceId: trace-demo-001
+                  timestamp: '2026-10-21T16:02:00Z'
+            pending:
+              value:
+                data:
+                  status: PENDING
+                  items: []
+                meta:
+                  traceId: trace-demo-001
+                  timestamp: '2026-10-21T16:02:00Z'
+            empty:
+              value:
+                data:
+                  status: EMPTY
+                  items: []
+                meta:
+                  traceId: trace-demo-001
+                  timestamp: '2026-10-21T16:02:00Z'
+    MemoryRead:
+      description: Relevant eligible facts and observations, or an empty list if there are no matches. Backend failure
+        is not an empty result.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/MemoryResponse'
+          example:
+            data:
+              memories:
+              - memoryId: memory-demo-001
+                text: Repeated searches filter SUVs below $30,000.
+                type: OBSERVATION
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    ErasurePending:
+      description: Erasure registered or still running; affected writes are blocked. Repeat this DELETE to poll.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErasurePendingResponse'
+          example:
+            data:
+              status: PENDING
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+      headers:
+        Retry-After:
+          description: Suggested polling delay in seconds; not a completion-time guarantee.
+          schema:
+            type: integer
+            minimum: 1
+          example: 60
+    ErasureDone:
+      description: All affected cleanup and summary invalidation completed, or no matching evidence existed.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErasureDoneResponse'
+          example:
+            data:
+              status: DONE
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    Healthy:
+      description: CFS process is ready to serve; this is not a complete backend availability probe.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HealthResponse'
+          example:
+            data:
+              status: OK
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    BadRequest:
+      description: Invalid input, invalid policy, missing policy on creation, unsupported LTM key, or UNSUPPORTED_WINDOW
+        for a known subject. Cross-field checks run in CFS.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Request validation failed.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    Conflict:
+      description: POLICY_CONFLICT, LTM_KEY_CONFLICT, or ERASURE_PENDING. No alternate context is created.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: POLICY_CONFLICT
+              message: The supplied policy differs from the locked context policy.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    NotFound:
+      description: The requested context has no stored policy.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: CONTEXT_NOT_FOUND
+              message: Context not found.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    TooLarge:
+      description: Event data exceeds 65,536 UTF-8 bytes or the full request exceeds 131,072 bytes. Gateway-generated
+        failures may use its native body.
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/ErrorResponse'
+            - $ref: '#/components/schemas/GatewayError'
+          example:
+            error:
+              code: REQUEST_TOO_LARGE
+              message: Request exceeds the configured byte limit.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    Unauthorized:
+      description: Missing or invalid IAM/SigV4 authentication. API Gateway may return its native envelope and may
+        classify authentication failures as 403.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/GatewayError'
+          example:
+            message: Unauthorized
+    Forbidden:
+      description: Principal is not authorized for the operation, tenant, subject, or policy creation. Gateway errors
+        may not use the CFS envelope.
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/ErrorResponse'
+            - $ref: '#/components/schemas/GatewayError'
+          example:
+            error:
+              code: FORBIDDEN
+              message: Access denied.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+    Throttled:
+      description: Rate limited by CFS or gateway; back off before retrying.
+      content:
+        application/json:
+          schema:
+            oneOf:
+            - $ref: '#/components/schemas/ErrorResponse'
+            - $ref: '#/components/schemas/GatewayError'
+          example:
+            error:
+              code: RATE_LIMITED
+              message: Too many requests.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
+      headers:
+        Retry-After:
+          description: If supplied, minimum delay before retry in seconds.
+          schema:
+            type: integer
+            minimum: 1
+    Unavailable:
+      description: A required dependency or CFS operation is unavailable. A write may have committed; repeating
+        POST can append another event. No client duplicate-suppression guarantee is provided.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error:
+              code: SERVICE_UNAVAILABLE
+              message: A required backend is unavailable.
+            meta:
+              traceId: trace-demo-001
+              timestamp: '2026-10-21T16:02:00Z'
